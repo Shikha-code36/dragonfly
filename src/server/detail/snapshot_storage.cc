@@ -31,7 +31,7 @@
 #include "util/cloud/gcp/gcs_file.h"
 #endif
 
-#include <regex>
+#include <optional>
 
 #include "base/logging.h"
 #include "io/file_util.h"
@@ -81,24 +81,122 @@ pair<string, string> GetBucketPath(string_view path) {
 const int kRdbWriteFlags = O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC | O_DIRECT;
 #endif
 
-std::string EscapeRegex(string_view input) {
-  // List of regex special characters that need escaping
-  // We don't escape "{}" since we use them for our own placeholders.
-  constexpr std::string_view chars{"\\.^$|?*+()[]"};
-  std::string escaped;
+// NOTE: filename/object-key matching below is done with plain iterative scans rather than
+// std::regex. libstdc++'s ECMAScript engine backtracks recursively (one stack frame per
+// backtracked character), and these matchers run on proactor/connection fibers whose stacks
+// are much smaller than a normal thread's - a long or adversarial key/filename could exhaust
+// the stack and abort the process (same class of bug as #7973). See AGENTS.md's "avoid
+// std::regex in fiber/server paths" rule.
 
-  // Reserve space to avoid multiple reallocations
-  escaped.reserve(input.size() * 1.1);
+enum class Placeholder { kNone, kYear, kMonth, kDay, kTimestamp };
 
-  for (char c : input) {
-    // If the character is in our specialChars list, prepend a backslash
-    if (chars.find(c) != std::string::npos) {
-      escaped += '\\';
+struct FilenameToken {
+  std::string literal;  // literal text to match before the placeholder (may be empty)
+  Placeholder placeholder = Placeholder::kNone;
+};
+
+// Splits a filename pattern containing {Y}/{m}/{d}/{timestamp} placeholders (everything else
+// is literal text) into a sequence of (literal, placeholder) pairs.
+std::vector<FilenameToken> TokenizeFilenamePattern(string_view pattern) {
+  std::vector<FilenameToken> tokens;
+  std::string literal;
+  auto flush = [&](Placeholder p) {
+    tokens.push_back({std::move(literal), p});
+    literal.clear();
+  };
+  while (!pattern.empty()) {
+    if (absl::ConsumePrefix(&pattern, "{timestamp}")) {
+      flush(Placeholder::kTimestamp);
+    } else if (absl::ConsumePrefix(&pattern, "{Y}")) {
+      flush(Placeholder::kYear);
+    } else if (absl::ConsumePrefix(&pattern, "{m}")) {
+      flush(Placeholder::kMonth);
+    } else if (absl::ConsumePrefix(&pattern, "{d}")) {
+      flush(Placeholder::kDay);
+    } else {
+      literal += pattern.front();
+      pattern.remove_prefix(1);
     }
-    escaped += c;
   }
+  tokens.push_back({std::move(literal), Placeholder::kNone});
+  return tokens;
+}
 
-  return escaped;
+bool ConsumeDigits(string_view* input, size_t count) {
+  if (input->size() < count)
+    return false;
+  for (size_t i = 0; i < count; ++i) {
+    if (!absl::ascii_isdigit(static_cast<unsigned char>((*input)[i])))
+      return false;
+  }
+  input->remove_prefix(count);
+  return true;
+}
+
+// Matches the fixed-width "YYYY-MM-DDTHH:MM:SS" shape used for {timestamp}.
+bool ConsumeTimestamp(string_view* input) {
+  string_view save = *input;
+  if (ConsumeDigits(input, 4) && absl::ConsumePrefix(input, "-") && ConsumeDigits(input, 2) &&
+      absl::ConsumePrefix(input, "-") && ConsumeDigits(input, 2) &&
+      absl::ConsumePrefix(input, "T") && ConsumeDigits(input, 2) &&
+      absl::ConsumePrefix(input, ":") && ConsumeDigits(input, 2) &&
+      absl::ConsumePrefix(input, ":") && ConsumeDigits(input, 2)) {
+    return true;
+  }
+  *input = save;
+  return false;
+}
+
+// Matches `key` against `tokens` from the start; returns the unmatched remainder of `key` on
+// success (letting the caller decide what, if anything, is allowed to follow), or nullopt if a
+// literal segment or placeholder failed to match.
+std::optional<string_view> MatchFilenameTokensPrefix(string_view key,
+                                                      const std::vector<FilenameToken>& tokens) {
+  string_view rest = key;
+  for (const auto& tok : tokens) {
+    if (!absl::ConsumePrefix(&rest, tok.literal))
+      return std::nullopt;
+    bool ok = true;
+    switch (tok.placeholder) {
+      case Placeholder::kYear:
+        ok = ConsumeDigits(&rest, 4);
+        break;
+      case Placeholder::kMonth:
+      case Placeholder::kDay:
+        ok = ConsumeDigits(&rest, 2);
+        break;
+      case Placeholder::kTimestamp:
+        ok = ConsumeTimestamp(&rest);
+        break;
+      case Placeholder::kNone:
+        break;
+    }
+    if (!ok)
+      return std::nullopt;
+  }
+  return rest;
+}
+
+// Matches `key` against `pattern`, where every literal occurrence of `marker` in `pattern` must
+// instead be `digit_width` digits in `key` (used for the DFS shard "summary" -> shard-id
+// substitution shared by the S3/GCS/Azure ExpandFromPath implementations).
+bool MatchWithDigitMarker(string_view key, string_view pattern, string_view marker,
+                          size_t digit_width) {
+  string_view rest = key;
+  size_t pos = 0;
+  while (true) {
+    size_t next = pattern.find(marker, pos);
+    string_view segment =
+        next == string_view::npos ? pattern.substr(pos) : pattern.substr(pos, next - pos);
+    if (!absl::ConsumePrefix(&rest, segment))
+      return false;
+    if (next == string_view::npos)
+      break;
+    if (!ConsumeDigits(&rest, digit_width))
+      return false;
+    pos = next + marker.size();
+  }
+  return rest.empty();
 }
 
 bool IsValidAzureAccount(string_view account) {
@@ -206,28 +304,21 @@ string SnapshotStorage::FindMatchingFile(string_view prefix, string_view dbfilen
   rng::sort(keys,
             [](const SnapStat& l, const SnapStat& r) { return l.last_modified > r.last_modified; });
 
-  // Create a regex to match the object keys, substituting the timestamp
-  // and adding an extension if needed.
+  // Build a token pattern to match the object keys against, substituting the timestamp
+  // placeholders and allowing for an extension if needed.
   fs::path fl_path{prefix};
   fl_path.append(dbfilename);
-  fl_path = EscapeRegex(fl_path.string());
-
-  SubstituteFilenamePlaceholders(&fl_path,
-                                 {.ts = "([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})",
-                                  .year = "([0-9]{4})",
-                                  .month = "([0-9]{2})",
-                                  .day = "([0-9]{2})"});
-  if (!fl_path.has_extension()) {
-    fl_path += "(-summary.dfs|.rdb)";
-  }
-  const std::regex re(fl_path.string());
+  bool has_extension = fl_path.has_extension();
+  std::vector<FilenameToken> tokens = TokenizeFilenamePattern(fl_path.string());
 
   for (const SnapStat& key : keys) {
-    DVLOG(1) << "Checking object key: " << key.name << " against regex: " << fl_path.string();
-    std::smatch m;
-    if (std::regex_match(key.name, m, re)) {
+    DVLOG(1) << "Checking object key: " << key.name << " against pattern: " << fl_path.string();
+    std::optional<string_view> rest = MatchFilenameTokensPrefix(key.name, tokens);
+    if (!rest)
+      continue;
+    bool matched = has_extension ? rest->empty() : (*rest == "-summary.dfs" || *rest == ".rdb");
+    if (matched)
       return key.name;
-    }
   }
   return {};
 }
@@ -482,7 +573,6 @@ io::Result<vector<string>, GenericError> GcsSnapshotStorage::ExpandFromPath(
     return vector<string>{};
 
   const auto [bucket_name, obj_path] = GetBucketPath(load_path);
-  regex re(absl::StrReplaceAll(obj_path, {{"summary", "[0-9]{4}"}}));
   string_view prefix = absl::StripSuffix(obj_path, kSummarySuffix);
 
   // Find snapshot shard files if we're loading DFS.
@@ -497,9 +587,7 @@ io::Result<vector<string>, GenericError> GcsSnapshotStorage::ExpandFromPath(
           error_code ec = gcs.List(
               bucket_name, prefix, false, 500,
               [&](const cloud::StorageListItem& item) {
-                std::smatch m;
-                string key{item.key};
-                if (std::regex_match(key, m, re)) {
+                if (MatchWithDigitMarker(item.key, obj_path, "summary", 4)) {
                   res.push_back(absl::StrCat(kGCSPrefix, bucket_name, "/", item.key));
                 }
               },
@@ -647,7 +735,6 @@ io::Result<vector<string>, GenericError> AzureSnapshotStorage::ExpandFromPath(
 
   const string& bucket_name = azure_path->container;
   const string& obj_path = azure_path->key;
-  regex re(absl::StrReplaceAll(obj_path, {{"summary", "[0-9]{4}"}}));
   string_view prefix = absl::StripSuffix(obj_path, kSummarySuffix);
 
   // Find snapshot shard files if we're loading DFS.
@@ -661,9 +748,7 @@ io::Result<vector<string>, GenericError> AzureSnapshotStorage::ExpandFromPath(
           error_code ec = azure.List(
               bucket_name, prefix, false, 500,
               [&](const cloud::StorageListItem& item) {
-                std::smatch m;
-                string key{item.key};
-                if (std::regex_match(key, m, re)) {
+                if (MatchWithDigitMarker(item.key, obj_path, "summary", 4)) {
                   res.push_back(BuildAzurePath({.account = creds_provider_->account_name(),
                                                 .container = bucket_name,
                                                 .key = string(item.key)}));
@@ -867,14 +952,11 @@ io::Result<vector<string>, GenericError> AwsS3SnapshotStorage::ExpandFromPath(
   }
 
   vector<string> paths;
-  obj_path = EscapeRegex(obj_path);
-  const std::regex re(absl::StrReplaceAll(obj_path, {{"summary", "[0-9]{4}"}}));
 
   for (const SnapStat& key : *list_res) {
-    std::smatch m;
-    DVLOG(1) << "Checking object key: " << key.name << " against regex: " << obj_path;
+    DVLOG(1) << "Checking object key: " << key.name << " against pattern: " << obj_path;
 
-    if (std::regex_match(key.name, m, re)) {
+    if (MatchWithDigitMarker(key.name, obj_path, "summary", 4)) {
       paths.push_back(std::string(kS3Prefix) + bucket_name + "/" + key.name);
     }
   }
